@@ -104,3 +104,18 @@
 - 全程留证：药品登记、批号入库、领用创建/提交/审核/驳回/撤回、库存扣减、休药锁定/释放均写 `t_med_change_evidence`（含操作者、前后快照与幂等请求号），可经 `GET /api/aqua/med/evidence` 按对象或 requestId 追溯；池塘休药锁定经 `GET /api/aqua/med/withdrawal-locks?pondId=` 查询。
 
 验收：`mvn test -Dtest=MedRequisitionAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点。
+
+## 捕捞预约与规格分仓（aqua-8）
+
+模块包路径 `com.evops.aqua.fishing`，打通：分级规则版本 → 按规格建库位 → 客户订单拆分预约 → 锁定占用库位 → 现场按实际规格分仓 → 检验复位 → 临时换车通知客户 → 完成生成差异单 → 订单完成冻结规则快照，全程留证。
+
+- 分级规则版本（`POST /api/aqua/fishing/grading-rules`）：版本下一组「规格 + 重量区间」（**半开区间 [min, max)**，行间不重叠）；**新版本发布后旧版本自动停用**，现场判级永远取当时生效版本；requestId 幂等。
+- 库位（`/api/aqua/fishing/bins`）：一仓对应一个规格；`POST /{id}/inspect` 检验完成——**库位状态与待检标识同一事务同步复位**（装货即 LOADING/FULL + 待检，检验后 CLEARED + 清除待检，不留中间态）。
+- 客户订单（`POST /api/aqua/fishing/orders`）：按**规格、重量区间和交付时间**拆分为捕捞预约，一行一条；重量区间须落在生效规则对应该规格区间内；requestId 幂等——**补传/重试返回首次订单，不会拆出第二批预约**。
+- 预约锁定（`POST /api/aqua/fishing/reservations/{id}/lock`）：指定或自动挑选本规格空闲库位占用；**锁定后库位不能被其他订单占用**（指定他单库位直接拒绝）。
+- 现场分仓（`POST /{id}/loads`，requestId 强制幂等）：实际均重按当时生效规则判实际规格，入对应规格库位（同订单可共用，他单占用拒绝；超容量拦截）；**补录/重试只形成一条可用记录，不重复加账**。
+- 完成（`POST /{id}/complete`）：**短装/超装自动生成差异单**（每预约至多一张，数量一致不生成）；完成前库位须先检验；完成交付后库位腾空释放、可被后续订单使用；全部预约完成后订单完成并**冻结当时分级规则快照**——已完成订单保留当时分级规则，新版本不影响。
+- 临时换车（`POST /{id}/vehicle-change`）：**原因必填**，换车记录与客户通知同一事务生成；客户签收（`POST /api/aqua/fishing/notifications/{id}/ack`）**留回执**，重复签收不覆盖首次回执；重试不重复换车、不重复通知。
+- 全程留证：规则发布/停用、库位登记/装货/检验/释放、订单创建/完成、预约拆分/锁定/完成、分仓、差异单、换车、通知签收均写 `t_fishing_change_evidence`（含操作者、前后快照与幂等请求号），可经 `GET /api/aqua/fishing/evidence` 按对象或 requestId 追溯。
+
+验收：`mvn test -Dtest=FishingReservationAcceptanceTest`，13 个检查点逐段输出报告，失败即停并给出停点。

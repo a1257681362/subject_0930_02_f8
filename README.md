@@ -104,3 +104,20 @@
 - 全程留证：药品登记、批号入库、领用创建/提交/审核/驳回/撤回、库存扣减、休药锁定/释放均写 `t_med_change_evidence`（含操作者、前后快照与幂等请求号），可经 `GET /api/aqua/med/evidence` 按对象或 requestId 追溯；池塘休药锁定经 `GET /api/aqua/med/withdrawal-locks?pondId=` 查询。
 
 验收：`mvn test -Dtest=MedRequisitionAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点。
+
+## 捕捞预约与规格分仓（aqua-8）
+
+模块包路径 `com.evops.aqua.harv`，打通：分级规则版本化 → 客户订单冻结版本 → 按规格/重量区间/交付时间拆分预约 → 锁定库位车辆互斥 → 临时换车留因并通知客户 → 现场按实际规格分仓（库位状态与待检标识同步）→ 检验通过解除待检 → 短装/超装差异单 → 补传/补录/重试只形成一条可用结果 → 完成订单保留当时分级规则，全程留证。
+
+- 分级规则版本（`POST /api/aqua/harv/grade-versions`）：按苗种发布规格代码+单尾重量闭区间，区间不得重叠；**新版本发布后同苗种旧版本自动停用**，已冻结到订单/预约的版本指针与规则行快照不受影响。
+- 客户订单（`POST /api/aqua/harv/orders`，requestId 幂等）：建单即取苗种当前生效版本并**冻结版本指针**；苗种无生效版本一律拒绝建单。
+- 拆分预约（`POST /{id}/split`，整次拆分共享 requestId）：按「规格 × 计划重量闭区间 × 交付时间」逐行拆成一行一预约，规格必须命中订单冻结版本并**复制规则行快照**（规格名/单尾重量区间）；重复提交返回同一批预约，订单转 CONFIRMED。
+- 锁定（`POST /api/aqua/harv/reservations/{id}/lock`，requestId 幂等）：独占绑定库位与车辆，库位须 AVAILABLE 且计划上限不超容量；**锁定后库位 LOCKED 且 reservationId 互斥，其他订单预约占用一律拒绝**；`/{id}/unlock` 释放后库位恢复 AVAILABLE、清空互斥指针与待检标识。
+- 临时换车（`POST /{id}/vehicle-change`，requestId 幂等）：仅 LOCKED/ALLOCATED 预约可换，**原因必填、新车不得与现车相同**；每次换车只追加一行并**触发客户通知**，客户签收（`POST /api/aqua/harv/notifications/{id}/ack`）留回执，重复签收不覆盖首次。
+- 现场分仓（`POST /api/aqua/harv/reservations/{id}/allocations`，requestId 幂等）：按**实际规格**逐行回传实际重量与落位库位（实际规格可与预约规格不同，但必须命中预约保留的分级版本）；每行落位库位置 OCCUPIED 并**打待检标识**，占用校验库位互斥与容量；检验通过（`POST /inspections/pass`）逐行解除待检，**库位内全部行通过后库位待检标识才同步解除**。
+- 差异单：实际总量落在计划闭区间之外即生成 **SHORT 短装 / OVER 超装**（记录计划区间、实际、差值），一张可用结果至多一张差异单，并通知客户；差异可处置登记但短/超事实不变。
+- **补传/补录/重试只形成一条可用结果**：回传来源 NORMAL/RETRANSMIT/BACKFILL/RETRY；同 requestId 重发原样返回首次结果；新 requestId 的补传/补录先整体校验，通过后把旧 USABLE 结果置 VOIDED（只追加留痕）、清旧分仓行与库位占用、作废其差异单，再重建唯一 USABLE 结果——任意时刻同预约只有一条可用结果，作废历史与作废证据均可查。
+- 完成订单（`POST /orders/{id}/complete`）：全部预约已分仓方可完成，**完成后永久保留建单时分级版本**（V2 发布不改变 COMPLETED/在途订单的 V1 快照），已完成订单不可取消；取消订单同步释放其锁定库位。
+- 全程留证：规则发布/建单/拆分/锁定/释放/分仓/作废/检验/差异/换车/通知/签收/完成均写 `t_harv_change_evidence`（含操作前后 JSON 快照、操作者与幂等请求号）；**分仓被拒的失败原因用独立事务留证**，不随业务回滚；可经 `GET /api/aqua/harv/evidence` 按对象或 requestId 追溯。
+
+验收：`mvn test -Dtest=HarvestReservationAcceptanceTest`，15 个检查点逐段输出报告，失败即停并给出停点。
